@@ -94,6 +94,16 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
+    <!-- EDL 分区表读取/读写依赖 fh_loader.exe，原先未在 csproj 声明，发布后程序目录中根本不存在。 -->
+    <Content Include="fh_loader.exe">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <!-- 应用管理读取 APK 名称与版本需要把 aapt-arm-pie 推送到设备执行，同样缺失声明。 -->
+    <Content Include="aapt-arm-pie">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
     <Content Include="..\avbtool\tools\pem\*.pem" Condition="Exists('..\avbtool\tools\pem')">
       <Link>avbtool\tools\pem\%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
