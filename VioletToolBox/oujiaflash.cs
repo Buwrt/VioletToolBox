@@ -1624,6 +1624,9 @@ namespace WpfApp1
             public bool AutoRebootRequested { get; }
             public bool PartitionTableValidationRequested { get; }
             public HashSet<string> AvailablePartitions { get; } = new(StringComparer.OrdinalIgnoreCase);
+            // 由 fastboot "has-slot:<name>: no" 明确声明的无 A/B 槽位分区。
+            // 相比按 _a/_b 是否存在的推断，这是设备自述的权威结论。
+            public HashSet<string> SlotlessPartitionNames { get; } = new(StringComparer.OrdinalIgnoreCase);
             public OujiaFlashRunStatus Status { get; set; } = OujiaFlashRunStatus.Running;
             public List<string> PhaseFailures { get; } = new();
             public bool CompletionLogged { get; set; }
@@ -2029,17 +2032,26 @@ namespace WpfApp1
                 return;
             }
 
-            string? targetSlot = await EnsureOujiaAbSlotSupportedAsync(fastbootSerial);
-            if (string.IsNullOrWhiteSpace(targetSlot))
+            string? confirmedSlot = await EnsureOujiaAbSlotSupportedAsync(fastbootSerial);
+            if (string.IsNullOrWhiteSpace(confirmedSlot))
             {
                 return;
             }
 
             bool isMediaTek = platform.Value == OujiaProcessorPlatform.MediaTek;
 
-            targetSlot = await GetCurrentSlot();
-            if (string.IsNullOrWhiteSpace(targetSlot) ||
-                !ValidateOujiaFlashTargetCollisions(plan, platform.Value, targetSlot))
+            string? targetSlot = await GetCurrentSlot();
+            // 部分新平台机型（如一加13）getvar current-slot 可能返回异常或空值，
+            // 此时回退到已经确认可用的槽位，避免整个线刷任务被无谓终止。
+            if (string.IsNullOrWhiteSpace(targetSlot))
+            {
+                LogToOugaFlash(
+                    $"当前槽位查询失败，回退使用已确认槽位 {confirmedSlot.ToUpper()} 槽.",
+                    "Orange");
+                targetSlot = confirmedSlot;
+            }
+
+            if (!ValidateOujiaFlashTargetCollisions(plan, platform.Value, targetSlot))
             {
                 return;
             }
@@ -3730,6 +3742,9 @@ namespace WpfApp1
                 _activeOujiaFlashSession.AvailablePartitions.Clear();
                 _activeOujiaFlashSession.AvailablePartitions.UnionWith(
                     ParseOujiaAvailablePartitionNames(partitionTable));
+                _activeOujiaFlashSession.SlotlessPartitionNames.Clear();
+                _activeOujiaFlashSession.SlotlessPartitionNames.UnionWith(
+                    ParseOujiaSlotlessPartitionNames(partitionTable));
             }
 
             bool isMediaTek = Regex.IsMatch(
@@ -3979,7 +3994,7 @@ namespace WpfApp1
 
             foreach (Match partitionMatch in Regex.Matches(
                          partitionTable,
-                         @"partition-(?:size|type):(?<name>[^:\s]+)\s*:",
+                         @"partition-(?:size|type|has-slot):(?<name>[^:\s]+)\s*:",
                          RegexOptions.IgnoreCase))
             {
                 string partitionName = partitionMatch.Groups["name"].Value.Trim();
@@ -3990,6 +4005,34 @@ namespace WpfApp1
             }
 
             return availablePartitions;
+        }
+
+        // 从 "getvar all" 输出中解析设备自述的无 A/B 槽位分区。
+        // fastboot 会以 "has-slot:<name>: no" 明确声明该分区不存在槽位后缀，
+        // 这比"按 _a/_b 是否存在去猜"权威得多，可避免新平台被误加 _a 后缀而刷写失败。
+        private static HashSet<string> ParseOujiaSlotlessPartitionNames(
+            string partitionTable)
+        {
+            var slotlessPartitions =
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrWhiteSpace(partitionTable))
+            {
+                return slotlessPartitions;
+            }
+
+            foreach (Match slotMatch in Regex.Matches(
+                         partitionTable,
+                         @"has-slot:(?<name>[^:\s]+)\s*:\s*(?<value>no|false|0)\b",
+                         RegexOptions.IgnoreCase))
+            {
+                string partitionName = slotMatch.Groups["name"].Value.Trim();
+                if (!string.IsNullOrWhiteSpace(partitionName))
+                {
+                    slotlessPartitions.Add(partitionName);
+                }
+            }
+
+            return slotlessPartitions;
         }
 
         private bool ValidateOujiaPartitionTableCompatibility(
@@ -4159,11 +4202,25 @@ namespace WpfApp1
         private bool IsOujiaKnownSlotlessPartition(string partitionName)
         {
             string baseName = NormalizeOujiaPartitionBaseName(partitionName);
+
+            // 优先采用设备自述结论：fastboot "has-slot:<name>: no"。
+            HashSet<string>? slotless = _activeOujiaFlashSession?.SlotlessPartitionNames;
+            if (slotless != null && slotless.Contains(baseName))
+            {
+                return true;
+            }
+
             HashSet<string>? available = _activeOujiaFlashSession?.AvailablePartitions;
-            return available != null &&
-                   available.Contains(baseName) &&
-                   !available.Contains($"{baseName}_a") &&
-                   !available.Contains($"{baseName}_b");
+
+            // 设备上确实存在带槽位后缀的分区时，必须保留后缀。
+            if (available != null &&
+                (available.Contains($"{baseName}_a") || available.Contains($"{baseName}_b")))
+            {
+                return false;
+            }
+
+            // 回退：仅当设备只存在无后缀分区时才视为无槽位分区。
+            return available != null && available.Contains(baseName);
         }
 
         private bool ValidateOujiaFlashTargetCollisions(

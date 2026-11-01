@@ -1,0 +1,48 @@
+name: Build VioletToolBox (Windows x64)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore VioletToolBox/SmartTool.csproj
+
+      - name: Build
+        run: dotnet build VioletToolBox/SmartTool.csproj -c Release --no-restore
+
+      - name: Publish (win-x64, framework-dependent)
+        run: dotnet publish VioletToolBox/SmartTool.csproj -c Release -r win-x64 --self-contained false -o build/win-x64
+
+      - name: List publish output
+        run: Get-ChildItem -Recurse build\win-x64 | Select-Object -First 60 FullName, Length
+
+      - name: Package full publish output
+        run: Compress-Archive -Path build\win-x64\* -DestinationPath build\VioletToolBox-win-x64.zip
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VioletToolBox-exe
+          path: build/win-x64/VioletToolBox.exe
+          if-no-files-found: error
+
+      - name: Upload full package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VioletToolBox-win-x64
+          path: build/VioletToolBox-win-x64.zip
+          if-no-files-found: error

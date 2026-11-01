@@ -604,6 +604,18 @@ namespace WpfApp1
         private ObservableCollection<AppPackageItem> AppPackages = new ObservableCollection<AppPackageItem>();
         private string? magiskApkPath;
         private string magiskbootPath = string.Empty;
+
+        // 最近一次成功探测到的 by-name 分区根目录（例如 /dev/block/by-name）。
+        // 玄戒(XRING)/MTK/部分非高通平台并不存在 /dev/block/bootdevice/by-name，
+        // 因此任何 dd 读写都必须复用探测结果，不能硬编码 bootdevice 路径。
+        private string _adbPartitionRoot = string.Empty;
+
+        // 约定的分区根目录候选，顺序即优先级。
+        private static readonly string[] AdbPartitionRootCandidates =
+        {
+            "/dev/block/by-name",
+            "/dev/block/bootdevice/by-name"
+        };
         private string tempDir = string.Empty;
         private const string DriverListSourceUrl = "https://gitee.com/smartpaocai/smart-tool/blob/master/download/qudong.json";
         private const string RootManagerListSourceUrl = "https://gitee.com/smartpaocai/smart-tool/blob/master/download/rootmanager.json";
@@ -1533,15 +1545,26 @@ namespace WpfApp1
                 cancellationToken.ThrowIfCancellationRequested();
                 LogFastbootEraseBegin(partitionName);
                 
-                string partitionPath = $"/dev/block/bootdevice/by-name/{partitionName}";
-                
+                // 解析当前设备上该分区的真实块设备路径（兼容玄戒/MTK等非高通平台）
+                string? partitionPath = await ResolveAdbPartitionBlockPathAsync(
+                    partitionName,
+                    deviceSerial: null,
+                    cancellationToken);
+                if (string.IsNullOrWhiteSpace(partitionPath))
+                {
+                    failedPartitionCount++;
+                    LogFastbootEraseEndFail(partitionName);
+                    LogToFastboot($"未能在设备上定位分区 {partitionName} 的块设备路径，已跳过", "Red");
+                    continue;
+                }
+
                 // 使用dd命令将零数据写入分区来擦除
                 string eraseCommand = $"shell su -c \"dd if=/dev/zero of={partitionPath} bs=4096 count=1024\"";
                 string result_erase = await ExecuteAdbCommandWithOutput(
                     eraseCommand,
                     CancellationToken.None);
-                
-                if (result_erase.Contains("error") || result_erase.Contains("failed") || result_erase.Contains("not found"))
+
+                if (IsAdbShellCommandFailure(result_erase))
                 {
                     failedPartitionCount++;
                     LogFastbootEraseEndFail(partitionName);
@@ -11152,6 +11175,9 @@ namespace WpfApp1
                             "Red");
                         return;
                     }
+
+                    // 缓存本次探测到的分区根目录，供后续 dd 读写复用。
+                    _adbPartitionRoot = partitionRoot;
                     
                     var filteredPartitions = partitions.Where(p => 
                         !p.PartitionName.ToLower().Contains("slot") &&
@@ -11183,6 +11209,113 @@ namespace WpfApp1
                     AdbReadPartitionTableButton.IsEnabled = true;
                 }
             }
+        }
+
+        // 解析指定分区在当前设备上的真实块设备路径。
+        // 优先复用最近一次探测成功的分区根目录，再依次尝试约定路径，
+        // 最后让设备端 readlink 兜底，彻底避免硬编码 bootdevice 路径。
+        private async Task<string?> ResolveAdbPartitionBlockPathAsync(
+            string partitionName,
+            string? deviceSerial = null,
+            CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(partitionName))
+            {
+                return null;
+            }
+
+            string adbPath = GetAdbPath();
+            if (string.IsNullOrWhiteSpace(adbPath))
+            {
+                return null;
+            }
+
+            string serialPrefix = string.IsNullOrWhiteSpace(deviceSerial)
+                ? string.Empty
+                : $"-s {deviceSerial} ";
+
+            var roots = new List<string>();
+            if (!string.IsNullOrWhiteSpace(_adbPartitionRoot))
+            {
+                roots.Add(_adbPartitionRoot);
+            }
+
+            foreach (string candidate in AdbPartitionRootCandidates)
+            {
+                if (!roots.Contains(candidate, StringComparer.Ordinal))
+                {
+                    roots.Add(candidate);
+                }
+            }
+
+            foreach (string root in roots)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                string testPath = $"{root}/{partitionName}";
+                string output = await GetCommandOutput(
+                    adbPath,
+                    $"{serialPrefix}shell \"su -c 'ls -l {testPath}'\"",
+                    cancellationToken);
+                if (!IsAdbShellCommandFailure(output))
+                {
+                    _adbPartitionRoot = root;
+                    return testPath;
+                }
+            }
+
+            // 兜底：让设备端自行解析符号链接，不依赖任何约定目录。
+            foreach (string root in roots)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                string output = await GetCommandOutput(
+                    adbPath,
+                    $"{serialPrefix}shell \"su -c 'readlink -f {root}/{partitionName}'\"",
+                    cancellationToken);
+                string resolved = (output ?? string.Empty).Trim();
+                if (resolved.StartsWith("/dev/", StringComparison.Ordinal) &&
+                    !resolved.Contains("No such file", StringComparison.OrdinalIgnoreCase))
+                {
+                    _adbPartitionRoot = root;
+                    return resolved;
+                }
+            }
+
+            // 最后尝试：直接枚举 /dev/block 下的 by-name 变体。
+            string discovered = await GetCommandOutput(
+                adbPath,
+                $"{serialPrefix}shell \"su -c 'find /dev/block -name {partitionName} -type l 2>/dev/null'\"",
+                cancellationToken);
+            foreach (string line in (discovered ?? string.Empty).Split('\n'))
+            {
+                string candidate = line.Trim();
+                if (candidate.StartsWith("/dev/", StringComparison.Ordinal))
+                {
+                    return candidate;
+                }
+            }
+
+            return null;
+        }
+
+        // 判定 adb shell 命令输出是否为失败。
+        // dd 的真实报错文案是 "No such file or directory"，
+        // 旧实现只匹配 error/failed/not found 三个关键词，会漏判 dd 失败。
+        private static bool IsAdbShellCommandFailure(string? output)
+        {
+            if (string.IsNullOrWhiteSpace(output))
+            {
+                return true;
+            }
+
+            return output.Contains("No such file", StringComparison.OrdinalIgnoreCase)
+                || output.Contains("No such device", StringComparison.OrdinalIgnoreCase)
+                || output.Contains("No such directory", StringComparison.OrdinalIgnoreCase)
+                || output.Contains("Permission denied", StringComparison.OrdinalIgnoreCase)
+                || output.Contains("Operation not permitted", StringComparison.OrdinalIgnoreCase)
+                || output.Contains("Invalid argument", StringComparison.OrdinalIgnoreCase)
+                || output.Contains("error", StringComparison.OrdinalIgnoreCase)
+                || output.Contains("failed", StringComparison.OrdinalIgnoreCase)
+                || output.Contains("not found", StringComparison.OrdinalIgnoreCase);
         }
 
         private async Task<(string Root, List<PartitionInfo> Partitions)>
@@ -12156,7 +12289,12 @@ namespace WpfApp1
                     }
                     
                     // 使用dd命令将Download目录中的文件写入到分区
-                    string partitionPath = $"/dev/block/by-name/{partition.PartitionName}";
+                    // 解析真实块设备路径：既兼容玄戒/MTK 等只有 /dev/block/by-name 的设备，
+                    // 也兼容仅有 /dev/block/bootdevice/by-name 的老高通设备。
+                    string partitionPath = await ResolveAdbPartitionBlockPathAsync(
+                        partition.PartitionName,
+                        deviceSerial: null,
+                        CancellationToken.None) ?? $"/dev/block/by-name/{partition.PartitionName}";
                     string ddCommand = $"shell su -c 'dd if={deviceDownloadPath} of={partitionPath} bs=4096'";
                     string ddResult = await ExecuteAdbCommandWithOutput(ddCommand, CancellationToken.None);
                     
@@ -12432,13 +12570,30 @@ namespace WpfApp1
 
                 string devicePath = $"/sdcard/Download/{partition}.img";
                 string localPath = System.IO.Path.Combine(backupDir, $"{partition}{outputExtension}");
-                string partitionPath = $"/dev/block/bootdevice/by-name/{partition}";
+
+                // 解析当前设备上该分区的真实块设备路径。
+                // 玄戒(XRING)/MTK 等平台不存在 /dev/block/bootdevice/by-name，
+                // 必须复用分区表探测结果，不能硬编码。
+                string? partitionPath = await ResolveAdbPartitionBlockPathAsync(
+                    partition,
+                    deviceSerial: null,
+                    cancellationToken);
+                if (string.IsNullOrWhiteSpace(partitionPath))
+                {
+                    LogFastbootReadEndFail(partition);
+                    LogToFastboot($"未能在设备上定位分区 {partition} 的块设备路径，已跳过", "Red");
+                    await CleanupAdbTemporaryFileAsync(devicePath);
+                    allSucceeded = false;
+                    continue;
+                }
 
                 // 使用dd命令读取分区
                 string ddCommand = $"shell su -c \"dd if={partitionPath} of={devicePath} bs=4096\"";
                 string ddResult = await ExecuteAdbCommandWithOutput(ddCommand, cancellationToken);
 
-                if (ddResult.Contains("error") || ddResult.Contains("failed") || ddResult.Contains("not found"))
+                // dd 的真实报错文案为 "No such file or directory"，
+                // 旧判定只匹配 error/failed/not found，会漏判并误导成 SYNC FAIL。
+                if (IsAdbShellCommandFailure(ddResult))
                 {
                     LogFastbootReadEndFail(partition);
                     if (!string.IsNullOrWhiteSpace(ddResult))
@@ -12859,6 +13014,49 @@ namespace WpfApp1
             }
         }
 
+        // 在小米刷机包目录（含子目录）中定位指定的刷机脚本。
+        // 官方包常见两种布局：脚本直接位于包根目录，或位于包内一层机型目录下。
+        private static string? TryFindXiaomiFlashScript(string packagePath, string batFileName)
+        {
+            try
+            {
+                string[] found = Directory.GetFiles(
+                    packagePath,
+                    batFileName,
+                    SearchOption.AllDirectories);
+                return found.Length > 0 ? found[0] : null;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"查找小米刷机脚本失败: {ex.Message}");
+                return null;
+            }
+        }
+
+        // 在小米刷机包目录（含子目录）中定位 images 镜像目录。
+        private static string? TryFindXiaomiImagesDirectory(string scriptDirectory)
+        {
+            try
+            {
+                string direct = Path.Combine(scriptDirectory, "images");
+                if (Directory.Exists(direct))
+                {
+                    return direct;
+                }
+
+                string[] found = Directory.GetDirectories(
+                    scriptDirectory,
+                    "images",
+                    SearchOption.AllDirectories);
+                return found.Length > 0 ? found[0] : null;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"查找小米 images 目录失败: {ex.Message}");
+                return null;
+            }
+        }
+
         // 开始小米线刷
         private async void StartXiaomiFlashButton_Click(object sender, RoutedEventArgs e)
         {
@@ -12922,8 +13120,17 @@ namespace WpfApp1
                 string scriptPath = Path.Combine(packagePath, batFileName);
                 if (!File.Exists(scriptPath))
                 {
-                    LogToFlashTextBox($"错误: 在刷机包中未找到 {batFileName} 文件");
-                    return;
+                    // 小米线刷包解压后常多一层机型目录（<包>/<机型_images_xxx>/flash_all.bat），
+                    // 旧的扁平假设会直接报“未找到 flash_all.bat”。这里向下递归定位真实脚本。
+                    string? foundScript = TryFindXiaomiFlashScript(packagePath, batFileName);
+                    if (string.IsNullOrWhiteSpace(foundScript))
+                    {
+                        LogToFlashTextBox($"错误: 在刷机包中未找到 {batFileName} 文件");
+                        return;
+                    }
+
+                    scriptPath = foundScript;
+                    LogToFlashTextBox($"已在子目录中定位脚本: {scriptPath}");
                 }
 
                 LogToFlashTextBox($"选择的刷机模式: {operationType}");
@@ -12971,6 +13178,17 @@ if (startXiaomiFlashButton != null)
                 LogToFlashTextBox($"刷机包目录: {packagePath}");
                 LogToFlashTextBox($"脚本路径: {scriptPath}");
 
+                string scriptDirectory = Path.GetDirectoryName(scriptPath) ?? packagePath;
+                string? imagesDirectory = TryFindXiaomiImagesDirectory(scriptDirectory);
+                if (string.IsNullOrWhiteSpace(imagesDirectory))
+                {
+                    LogToFlashTextBox("警告: 未在刷机包中找到 images 镜像目录，请确认刷机包完整");
+                }
+                else
+                {
+                    LogToFlashTextBox($"镜像目录: {imagesDirectory}");
+                }
+
                 InitializeXiaomiFlashProgress(scriptPath);
 
                 // 在flash文件夹中通过cmd执行脚本路径
@@ -12980,18 +13198,34 @@ if (startXiaomiFlashButton != null)
                 {
                     try
                     {
+                        var startInfo = new ProcessStartInfo
+                        {
+                            FileName = "cmd.exe",
+                            // 工作目录必须是脚本所在目录：小米脚本里的 images\xxx.img 是相对路径，
+                            // 旧实现把工作目录设成 platform-tools，会导致镜像路径解析失败而刷不进去。
+                            // 追加 "< nul" 让脚本末尾可能存在的 pause 立即返回，避免进程永不退出。
+                            Arguments = $"/c \"\"{scriptPath}\" < nul\"",
+                            WorkingDirectory = scriptDirectory,
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            CreateNoWindow = true
+                        };
+
+                        // 工作目录改到脚本目录后，仍需保证 fastboot 可被脚本找到。
+                        if (Directory.Exists(flashDirectory))
+                        {
+                            string currentPath = startInfo.EnvironmentVariables["PATH"] ?? string.Empty;
+                            if (!currentPath.Contains(flashDirectory, StringComparison.OrdinalIgnoreCase))
+                            {
+                                startInfo.EnvironmentVariables["PATH"] =
+                                    flashDirectory + Path.PathSeparator + currentPath;
+                            }
+                        }
+
                         var process = new Process
                         {
-                            StartInfo = new ProcessStartInfo
-                            {
-                                FileName = "cmd.exe",
-                                Arguments = $"/c \"{scriptPath}\"",
-                                WorkingDirectory = flashDirectory,
-                                UseShellExecute = false,
-                                RedirectStandardOutput = true,
-                                RedirectStandardError = true,
-                                CreateNoWindow = true
-                            }
+                            StartInfo = startInfo
                         };
 
                         // 实时读取输出
@@ -19019,33 +19253,21 @@ public partial class MainWindow : Window
                 
                 foreach (string line in lines)
                 {
-                    // 查找fastboot flash命令行
-                    if (line.Trim().StartsWith("fastboot") && line.Contains("flash"))
+                    // 匹配 fastboot flash 命令行。
+                    // 旧实现要求行首必须等于 "fastboot"，无法识别
+                    // "%~dp0bin\fastboot.exe %* flash xxx images\xxx.img" 一类写法，
+                    // 会导致解析出的分区列表为空。
+                    Match flashMatch = Regex.Match(
+                        line,
+                        @"(?i)\bfastboot(?:\.exe)?\b.*?\bflash\s+(?<partition>[^\s""']+)\s+(?<image>""[^""]+""|[^\s|&]+)");
+                    if (flashMatch.Success)
                     {
-                        // 解析fastboot flash命令
-                        string[] parts = line.Trim().Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                        
-                        // 找到flash关键字的位置
-                        int flashIndex = -1;
-                        for (int i = 0; i < parts.Length; i++)
                         {
-                            if (parts[i] == "flash")
+                            string partitionName = flashMatch.Groups["partition"].Value.Trim();
+
+                            // 获取镜像文件路径并归一化常见前缀
+                            string imagePath = flashMatch.Groups["image"].Value.Trim().Trim('"', '\'');
                             {
-                                flashIndex = i;
-                                break;
-                            }
-                        }
-                        
-                        // 如果找到flash关键字且后面有分区名称
-                        if (flashIndex >= 0 && flashIndex + 1 < parts.Length)
-                        {
-                            string partitionName = parts[flashIndex + 1];
-                            
-                            // 获取镜像文件路径（如果存在）
-                            string imagePath = "";
-                            if (flashIndex + 2 < parts.Length)
-                            {
-                                imagePath = parts[flashIndex + 2];
                                 // 移除可能的路径前缀
                                 if (imagePath.Contains("%~dp0images/"))
                                 {
@@ -19054,6 +19276,16 @@ public partial class MainWindow : Window
                                 else if (imagePath.Contains("%~dp0images\\"))
                                 {
                                     imagePath = imagePath.Replace("%~dp0images\\", "");
+                                }
+                                else if (imagePath.Contains("images/"))
+                                {
+                                    imagePath = imagePath.Substring(
+                                        imagePath.IndexOf("images/", StringComparison.OrdinalIgnoreCase) + "images/".Length);
+                                }
+                                else if (imagePath.Contains("images\\"))
+                                {
+                                    imagePath = imagePath.Substring(
+                                        imagePath.IndexOf("images\\", StringComparison.OrdinalIgnoreCase) + "images\\".Length);
                                 }
                             }
                             
