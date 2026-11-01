@@ -5,6 +5,9 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -27,9 +30,6 @@ jobs:
       - name: Publish (win-x64, framework-dependent)
         run: dotnet publish VioletToolBox/SmartTool.csproj -c Release -r win-x64 --self-contained false -o build/win-x64
 
-      - name: List publish output
-        run: Get-ChildItem -Recurse build\win-x64 | Select-Object -First 60 FullName, Length
-
       - name: Package full publish output
         run: Compress-Archive -Path build\win-x64\* -DestinationPath build\VioletToolBox-win-x64.zip
 
@@ -46,3 +46,20 @@ jobs:
           name: VioletToolBox-win-x64
           path: build/VioletToolBox-win-x64.zip
           if-no-files-found: error
+
+      - name: Commit build output back to repository
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          New-Item -ItemType Directory -Force -Path build-output | Out-Null
+          Copy-Item build\win-x64\VioletToolBox.exe build-output\VioletToolBox.exe -Force
+          Copy-Item build\VioletToolBox-win-x64.zip build-output\VioletToolBox-win-x64.zip -Force
+          git add -f build-output/VioletToolBox.exe build-output/VioletToolBox-win-x64.zip
+          if (git diff --cached --quiet) {
+            Write-Host "构建产物无变化，跳过提交"
+          } else {
+            git commit -m "chore: 更新 Windows x64 构建产物 [skip ci]"
+            git push
+            Write-Host "已回写构建产物"
+          }
